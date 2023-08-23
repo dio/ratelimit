@@ -1,0 +1,8 @@
+version: v1
+plugins:
+- name: go
+  out: .
+  opt: paths=source_relative,plugins=grpc
+- name: go
+  out: '.repo/go-control-plane'
+  opt: paths=source_relative,plugins=grpc

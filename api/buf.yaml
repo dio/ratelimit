@@ -1,0 +1,6 @@
+version: v1
+deps:
+# Note: We can download this to from source. However, seems like these two repositories are stable.
+# Hence, BSR sync can catch up well.
+  - buf.build/googleapis/googleapis # https://buf.build/googleapis/googleapis/commits/main.
+  - buf.build/cncf/xds # https://buf.build/cncf/xds/commits/main.
