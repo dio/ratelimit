@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+
+set -e
+
+# Use: REMOTE=<your-fork> ./script/sync, e.g. REMOTE=dio/go-control-plane ./script/sync, to test out the script.
+go_control_plane_remote=${REMOTE:-envoyproxy/go-control-plane.git}
+readonly go_control_plane_remote
+
+echo "Using ${go_control_plane_remote} as the remote repository..."
+
+buf=github.com/bufbuild/buf/cmd/buf@v1.26.1
+readonly buf
+
+root_dir=$(git rev-parse --show-toplevel)
+readonly root_dir
+
+api_dir=${root_dir}/api
+readonly api_dir
+
+tools_dir=${api_dir}/.tools
+readonly tools_dir
+
+repo_dir=${api_dir}/.repo
+readonly repo_dir
+
+repo_envoy_dir=${repo_dir}/envoy
+readonly repo_envoy_dir
+
+repo_rules_go_dir=${repo_dir}/rules_go
+readonly repo_rules_go_dir
+
+repo_go_control_plane_dir=${repo_dir}/go-control-plane
+readonly repo_go_control_plane_dir
+
+envoy_commit_sha=main
+protoc_gen_go_version=v1.26.0
+
+checkout() {
+  rm -fr "${repo_dir}"
+  mkdir -p "${repo_dir}"
+
+  # Clone the envoyproxy/go-control-plane with a sensible --depth.
+  git clone --depth 100 "https://github.com/${go_control_plane_remote}.git" "${repo_go_control_plane_dir}"
+
+  # Get the matching mirrored commit SHA tarball.
+  envoy_commit_sha=$(git -C "${repo_go_control_plane_dir}" log --oneline | grep "Mirrored from envoyproxy/envoy" | head -n 1 | cut -d " " -f6)
+
+  echo "Downloading the latest mirrored envoyproxy/envoy@${envoy_commit_sha} archive..."
+  mkdir -p "${repo_envoy_dir}"
+  pushd "${repo_envoy_dir}"
+  curl -sL https://api.github.com/repos/envoyproxy/envoy/tarball/"${envoy_commit_sha}" | tar xz --strip-components=1
+  popd
+}
+
+install_tools() {
+  # Try to find the current bazelbuild/rules_go tag, in order to grab the right protoc-gen-go version.
+  # Note: The rules_go tag has a "v" prefix.
+  local rules_go_tag
+  rules_go_tag=v$(grep -A 4 io_bazel_rules_go "${repo_envoy_dir}"/bazel/repository_locations.bzl | grep -o 'version = "[^"]*' | cut -d '"' -f2)
+
+  local go_private_repositories_bzl
+  go_private_repositories_bzl=$(curl -sSL -H "Accept: application/vnd.github.v3.raw" https://api.github.com/repos/bazelbuild/rules_go/contents/go/private/repositories.bzl)
+
+  # We scrape the protoc-gen-go version from bazelbuild/rules_go/go/private/repositories.bzl. We look for com_github_golang_protobuf's version.
+  # Note: We use the legacy version of protoc-gen-go (from github.com/golang/protobuf) since rules_go prefers to generate gRPC codes via plugins (vs. --grpc_out).
+  # Reference: https://github.com/bazelbuild/rules_go/blob/30943d1bd319323bee7663c8f3f57b33d401ec6b/go/private/repositories.bzl#L157-L162.
+  local protoc_gen_go_version
+  protoc_gen_go_version=$(echo "${go_private_repositories_bzl}" | grep -A 4 com_github_golang_protobuf | grep -o 'v[0-9]\+\.[0-9]\+\.[0-9]\+' | head -1 | cut -d'"' -f1)
+
+  # We also scrape the google.golang.org/protobuf version, to be used in the generator library.
+  local org_google_golang_protobuf_version
+  org_golang_google_protobuf_version=$(echo "${go_private_repositories_bzl}" | grep -A 4 org_golang_google_protobuf | grep -o 'v[0-9]\+\.[0-9]\+\.[0-9]\+' | head -1 | cut -d'"' -f1)
+
+  local protoc_gen_go_src_dir
+  protoc_gen_go_src_dir="${tools_dir}"/protoc_gen_go_src
+
+  echo "Downloading the scraped golang/protobuf/protoc-gen-go@${protoc_gen_go_version} archive..."
+  mkdir -p "${protoc_gen_go_src_dir}"
+  pushd "${protoc_gen_go_src_dir}"
+  curl -sL https://api.github.com/repos/golang/protobuf/tarball/"${protoc_gen_go_version}" | tar xz --strip-components=1
+
+  # We update the library used for compiling the protoc-gen-go following bazelbuild/rules_go.
+  # Reference: https://github.com/bazelbuild/rules_go/blob/30943d1bd319323bee7663c8f3f57b33d401ec6b/third_party/com_github_golang_protobuf-gazelle.patch.
+  go get -u google.golang.org/protobuf@"${org_golang_google_protobuf_version}"
+  go mod tidy
+
+  # Then, install the binary to the tools directory.
+  GOBIN="${tools_dir}" go install github.com/golang/protobuf/protoc-gen-go
+  popd
+}
+
+generate() {
+  pushd "${api_dir}" || exit 1
+
+  # Link api/envoy from envoyproxy/proxy hence can be referenced by buf.
+  # Note: We may use BSR in the future, however, sometimes https://buf.build/envoyproxy/envoy/commits/main is not synchronized yet
+  # for a specified commit.
+  rm -fr "${api_dir}"/envoy
+  ln -s "${repo_envoy_dir}"/api/envoy .
+
+  # TODO(dio): Run linters.
+  PATH=${tools_dir}:$PATH go run "${buf}" mod update
+  PATH=${tools_dir}:$PATH go run "${buf}" generate --path ratelimit
+
+  popd || exit 1
+}
+
+checkout
+install_tools
+generate

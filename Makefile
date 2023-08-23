@@ -151,3 +151,6 @@ precommit_install:
 	go install mvdan.cc/sh/v3/cmd/shfmt@latest
 	go install golang.org/x/tools/cmd/goimports@v0.1.7
 	pre-commit install
+
+sync:
+	./script/sync
