@@ -48,7 +48,7 @@ func NewXdsGrpcSotwProvider(settings settings.Settings, statsManager stats.Manag
 		statsManager:           statsManager,
 		ctx:                    ctx,
 		configUpdateEventChan:  make(chan ConfigUpdateEvent),
-		connectionRetryChannel: make(chan bool),
+		connectionRetryChannel: make(chan bool, 2),
 		loader:                 config.NewRateLimitConfigLoaderImpl(),
 		adsClient:              sotw.NewADSClient(ctx, getClientNode(settings), resource.RateLimitConfigType),
 	}
@@ -139,10 +139,13 @@ func (p *XdsGrpcSotwProvider) getGrpcConnection() (*grpc.ClientConn, error) {
 		grpcOptions = append(grpcOptions,
 			grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(maxRecvMsgSize)))
 	}
-	return grpc.Dial(
-		p.settings.ConfigGrpcXdsServerUrl,
-		grpcOptions...,
-	)
+	ctx := p.ctx
+	if timeout := p.settings.ConfigGrpcXdsServerConnectRetryInterval; timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+	return grpc.DialContext(ctx, p.settings.ConfigGrpcXdsServerUrl, grpcOptions...)
 }
 
 func (p *XdsGrpcSotwProvider) getGrpcTransportCredentials() grpc.DialOption {
@@ -186,7 +189,10 @@ func (p *XdsGrpcSotwProvider) sendConfigs(resources []*anypb.Any) {
 }
 
 func (p *XdsGrpcSotwProvider) retryGrpcConn() {
-	p.connectionRetryChannel <- true
+	select {
+	case p.connectionRetryChannel <- true:
+	default: // channel already has a pending retry; skip to avoid blocking
+	}
 }
 
 func getClientNode(s settings.Settings) *corev3.Node {

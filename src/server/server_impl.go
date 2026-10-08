@@ -65,6 +65,7 @@ type server struct {
 	provider         provider.RateLimitConfigProvider
 	debugListener    serverDebugListener
 	httpServer       *http.Server
+	httpListener     net.Listener
 	listenerMu       sync.Mutex
 	health           *HealthChecker
 	grpcCertProvider *provider.CertProvider
@@ -181,6 +182,15 @@ func (server *server) Start(ctx context.Context) {
 
 	go server.startGrpc()
 
+	// Create the http.Server before registering the graceful-shutdown handler so
+	// that Stop() can always call httpServer.Close() — even if Serve() hasn't
+	// started yet. Go's http.Server.Close() sets a closed flag, and a subsequent
+	// Serve() call returns http.ErrServerClosed immediately.
+	srv := &http.Server{Handler: server.router}
+	server.listenerMu.Lock()
+	server.httpServer = srv
+	server.listenerMu.Unlock()
+
 	server.handleGracefulShutdown(ctx)
 
 	logger.Warnf("Listening for HTTP on '%s'", server.httpAddress)
@@ -188,9 +198,8 @@ func (server *server) Start(ctx context.Context) {
 	if err != nil {
 		logger.Fatalf("Failed to open HTTP listener: '%+v'", err)
 	}
-	srv := &http.Server{Handler: server.router}
 	server.listenerMu.Lock()
-	server.httpServer = srv
+	server.httpListener = list
 	server.listenerMu.Unlock()
 	err = srv.Serve(list)
 
@@ -252,11 +261,8 @@ func newServer(s settings.Settings, name string, statsManager stats.Manager, loc
 	})
 	grpcOptions := []grpc.ServerOption{
 		keepaliveOpt,
-		grpc.ChainUnaryInterceptor(
-			s.GrpcUnaryInterceptor, // chain otel interceptor after the input interceptor
-			otelgrpc.UnaryServerInterceptor(),
-		),
-		grpc.StreamInterceptor(otelgrpc.StreamServerInterceptor()),
+		grpc.StatsHandler(otelgrpc.NewServerHandler()),
+		grpc.UnaryInterceptor(s.GrpcUnaryInterceptor),
 	}
 	if s.GrpcServerUseTLS {
 		grpcServerTlsConfig := s.GrpcServerTlsConfig
@@ -358,6 +364,9 @@ func (server *server) Stop() {
 	}
 	if server.httpServer != nil {
 		server.httpServer.Close()
+	}
+	if server.httpListener != nil {
+		server.httpListener.Close()
 	}
 	server.provider.Stop()
 }
